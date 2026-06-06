@@ -69,6 +69,7 @@ func (r *clawXSettingsRepoStub) Delete(_ context.Context, key string) error {
 func TestGetClawXRuntimeSettingsHandlesPublicAPIBaseURLWithV1(t *testing.T) {
 	svc := &SettingService{settingRepo: &clawXSettingsRepoStub{values: map[string]string{
 		SettingKeyRegistrationEnabled: "true",
+		SettingKeyEmailVerifyEnabled:  "true",
 		SettingKeyAPIBaseURL:          "https://api.example.test/v1/",
 	}}}
 
@@ -85,6 +86,9 @@ func TestGetClawXRuntimeSettingsHandlesPublicAPIBaseURLWithV1(t *testing.T) {
 	}
 	if !got.RegistrationEnabled {
 		t.Fatal("RegistrationEnabled should inherit public registration setting")
+	}
+	if !got.EmailVerifyEnabled {
+		t.Fatal("EmailVerifyEnabled should inherit public email verify setting")
 	}
 }
 

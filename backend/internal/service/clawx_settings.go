@@ -38,6 +38,7 @@ const (
 type ClawXRuntimeSettings struct {
 	Enabled                 bool
 	RegistrationEnabled     bool
+	EmailVerifyEnabled      bool
 	LoginEnabled            bool
 	ActivationRequired      bool
 	APIOrigin               string
@@ -58,6 +59,7 @@ func (s *SettingService) GetClawXRuntimeSettings(ctx context.Context) ClawXRunti
 	out := ClawXRuntimeSettings{
 		Enabled:               true,
 		RegistrationEnabled:   true,
+		EmailVerifyEnabled:    false,
 		LoginEnabled:          true,
 		ActivationRequired:    false,
 		APIOrigin:             defaultClawXAPIOrigin,
@@ -76,6 +78,7 @@ func (s *SettingService) GetClawXRuntimeSettings(ctx context.Context) ClawXRunti
 	public, _ := s.GetPublicSettings(ctx)
 	if public != nil {
 		out.RegistrationEnabled = public.RegistrationEnabled
+		out.EmailVerifyEnabled = public.EmailVerifyEnabled
 		if raw := strings.TrimSpace(public.APIBaseURL); raw != "" {
 			applyClawXBaseURL(&out, raw)
 		}

@@ -251,6 +251,7 @@ func (h *ClawXHandler) Bootstrap(c *gin.Context) {
 		},
 		"auth": gin.H{
 			"registrationEnabled": settings.RegistrationEnabled,
+			"emailVerifyEnabled":  settings.EmailVerifyEnabled,
 			"loginEnabled":        settings.LoginEnabled,
 			"activationRequired":  settings.ActivationRequired,
 		},
