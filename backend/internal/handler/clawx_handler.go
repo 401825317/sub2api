@@ -126,7 +126,76 @@ func (h *ClawXHandler) runtimeSettings(c *gin.Context) service.ClawXRuntimeSetti
 	if h == nil || h.settingService == nil {
 		return service.ClawXRuntimeSettings{}
 	}
-	return h.settingService.GetClawXRuntimeSettings(c.Request.Context())
+	settings := h.settingService.GetClawXRuntimeSettings(c.Request.Context())
+	return service.ApplyClawXRequestOrigin(settings, clawXRequestOrigin(c))
+}
+
+func clawXRequestOrigin(c *gin.Context) string {
+	if c == nil || c.Request == nil {
+		return ""
+	}
+	host := firstForwardedClawXValue(c.GetHeader("X-Forwarded-Host"))
+	if host == "" {
+		host = strings.TrimSpace(c.Request.Host)
+	}
+	host = sanitizeClawXHost(host)
+	if host == "" {
+		return ""
+	}
+
+	proto := strings.ToLower(firstForwardedClawXValue(c.GetHeader("X-Forwarded-Proto")))
+	if proto == "" {
+		proto = strings.ToLower(firstForwardedClawXValue(c.GetHeader("X-Forwarded-Scheme")))
+	}
+	if proto != "http" && proto != "https" {
+		proto = "https"
+		if isLocalClawXHost(host) {
+			proto = "http"
+		}
+	}
+	return proto + "://" + host
+}
+
+func firstForwardedClawXValue(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if before, _, ok := strings.Cut(raw, ","); ok {
+		raw = before
+	}
+	return strings.TrimSpace(raw)
+}
+
+func sanitizeClawXHost(raw string) string {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "http://")
+	raw = strings.TrimPrefix(raw, "https://")
+	if before, _, ok := strings.Cut(raw, "/"); ok {
+		raw = before
+	}
+	if raw == "" || strings.ContainsAny(raw, " \t\r\n") {
+		return ""
+	}
+	return raw
+}
+
+func isLocalClawXHost(host string) bool {
+	host = strings.ToLower(hostWithoutClawXPort(host))
+	return host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1"
+}
+
+func hostWithoutClawXPort(host string) string {
+	if strings.HasPrefix(host, "[") {
+		if end := strings.Index(host, "]"); end >= 0 {
+			return host[:end+1]
+		}
+		return host
+	}
+	if before, _, ok := strings.Cut(host, ":"); ok {
+		return before
+	}
+	return host
 }
 
 func clawXRuntime(settings service.ClawXRuntimeSettings) clawXRuntimePayload {

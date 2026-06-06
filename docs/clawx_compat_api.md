@@ -4,8 +4,10 @@ Status: draft for `feature/clawx-junfeiai-compat`
 
 This document defines the first Sub2API-side contract for migrating the ClawBox
 activation, authorization, built-in provider, and skill-list experience to ClawX.
-The public service origin is `https://junfeiai.com`; the ClawX compatibility API
-is exposed under `/api/clawx/*`.
+The ClawX compatibility API is exposed under `/api/clawx/*`. Runtime URLs follow
+the public request origin by default, such as `https://junfeiai.com` or
+`https://zz-cn.lingzhiwuxian.com`; set `clawx_gateway_base_url` only when ClawX
+must be forced to one canonical gateway.
 
 ## Goals
 
@@ -13,7 +15,8 @@ is exposed under `/api/clawx/*`.
   provider or pasting an API key.
 - Reuse existing Sub2API primitives where possible: users, auth tokens, redeem
   codes, API keys, user groups, and the `/v1/*` model gateway.
-- Keep model gateway requests on `https://junfeiai.com/v1`.
+- Keep model gateway requests on the same public origin as the ClawX bootstrap
+  request unless a dedicated `clawx_gateway_base_url` is configured.
 - Keep the desktop token/API-key material out of plaintext client config.
 - Support short offline grace only after a prior successful authorization check.
 - Start with bundled OpenClaw skills for the ClawBox-like skill list; keep remote
@@ -125,6 +128,10 @@ Suggested settings keys:
 - `clawx_fallback_models`
 - `clawx_offline_grace_seconds`
 - `clawx_skill_marketplace_enabled`
+
+`clawx_gateway_base_url` has the highest priority. When it is empty, bootstrap
+and auth responses derive `service.apiOrigin` and `runtime.baseUrl` from the
+current request host, falling back to the public `api_base_url` setting.
 
 ## POST /api/clawx/activation/check
 

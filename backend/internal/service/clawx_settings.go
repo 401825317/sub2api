@@ -42,6 +42,7 @@ type ClawXRuntimeSettings struct {
 	ActivationRequired      bool
 	APIOrigin               string
 	GatewayBaseURL          string
+	GatewayBaseURLExplicit  bool
 	ProviderKey             string
 	ProviderName            string
 	APIProtocol             string
@@ -114,6 +115,7 @@ func (s *SettingService) GetClawXRuntimeSettings(ctx context.Context) ClawXRunti
 	}
 	if raw := strings.TrimSpace(values[SettingKeyClawXGatewayBaseURL]); raw != "" {
 		applyClawXBaseURL(&out, raw)
+		out.GatewayBaseURLExplicit = true
 	}
 	if raw := strings.TrimSpace(values[SettingKeyClawXProviderKey]); raw != "" {
 		out.ProviderKey = raw
@@ -144,6 +146,14 @@ func (s *SettingService) GetClawXRuntimeSettings(ctx context.Context) ClawXRunti
 	}
 
 	return out
+}
+
+func ApplyClawXRequestOrigin(settings ClawXRuntimeSettings, raw string) ClawXRuntimeSettings {
+	if settings.GatewayBaseURLExplicit {
+		return settings
+	}
+	applyClawXBaseURL(&settings, raw)
+	return settings
 }
 
 func applyClawXBaseURL(out *ClawXRuntimeSettings, raw string) {

@@ -80,6 +80,9 @@ func TestGetClawXRuntimeSettingsHandlesPublicAPIBaseURLWithV1(t *testing.T) {
 	if got.GatewayBaseURL != "https://api.example.test/v1" {
 		t.Fatalf("GatewayBaseURL = %q, want https://api.example.test/v1", got.GatewayBaseURL)
 	}
+	if got.GatewayBaseURLExplicit {
+		t.Fatal("GatewayBaseURLExplicit = true, want false for public API base URL")
+	}
 	if !got.RegistrationEnabled {
 		t.Fatal("RegistrationEnabled should inherit public registration setting")
 	}
@@ -121,6 +124,9 @@ func TestGetClawXRuntimeSettingsAppliesClawXOverrides(t *testing.T) {
 	if got.APIOrigin != "https://gateway.example.test" || got.GatewayBaseURL != "https://gateway.example.test/v1" {
 		t.Fatalf("base URLs = %q / %q", got.APIOrigin, got.GatewayBaseURL)
 	}
+	if !got.GatewayBaseURLExplicit {
+		t.Fatal("GatewayBaseURLExplicit = false, want true")
+	}
 	if got.ProviderKey != "custom-provider" || got.ProviderName != "Custom Provider" {
 		t.Fatalf("provider = %q / %q", got.ProviderKey, got.ProviderName)
 	}
@@ -138,5 +144,38 @@ func TestGetClawXRuntimeSettingsAppliesClawXOverrides(t *testing.T) {
 	}
 	if got.DefaultGroupID == nil || *got.DefaultGroupID != 42 {
 		t.Fatalf("DefaultGroupID = %#v, want 42", got.DefaultGroupID)
+	}
+}
+
+func TestApplyClawXRequestOriginOverridesNonExplicitBaseURL(t *testing.T) {
+	settings := ClawXRuntimeSettings{
+		APIOrigin:      "https://junfeiai.com",
+		GatewayBaseURL: "https://junfeiai.com/v1",
+	}
+
+	got := ApplyClawXRequestOrigin(settings, "https://zz-cn.lingzhiwuxian.com")
+
+	if got.APIOrigin != "https://zz-cn.lingzhiwuxian.com" {
+		t.Fatalf("APIOrigin = %q, want https://zz-cn.lingzhiwuxian.com", got.APIOrigin)
+	}
+	if got.GatewayBaseURL != "https://zz-cn.lingzhiwuxian.com/v1" {
+		t.Fatalf("GatewayBaseURL = %q, want https://zz-cn.lingzhiwuxian.com/v1", got.GatewayBaseURL)
+	}
+}
+
+func TestApplyClawXRequestOriginKeepsExplicitGatewayOverride(t *testing.T) {
+	settings := ClawXRuntimeSettings{
+		APIOrigin:              "https://gateway.example.test",
+		GatewayBaseURL:         "https://gateway.example.test/v1",
+		GatewayBaseURLExplicit: true,
+	}
+
+	got := ApplyClawXRequestOrigin(settings, "https://zz-cn.lingzhiwuxian.com")
+
+	if got.APIOrigin != "https://gateway.example.test" {
+		t.Fatalf("APIOrigin = %q, want https://gateway.example.test", got.APIOrigin)
+	}
+	if got.GatewayBaseURL != "https://gateway.example.test/v1" {
+		t.Fatalf("GatewayBaseURL = %q, want https://gateway.example.test/v1", got.GatewayBaseURL)
 	}
 }
