@@ -91,6 +91,11 @@ type clawXRegisterRequest struct {
 	Device           ClawXDevice `json:"device"`
 }
 
+type clawXSendVerifyCodeRequest struct {
+	Account string `json:"account"`
+	Email   string `json:"email"`
+}
+
 type clawXLoginRequest struct {
 	Account  string      `json:"account"`
 	Email    string      `json:"email"`
@@ -214,10 +219,13 @@ func (h *ClawXHandler) ActivationCheck(c *gin.Context) {
 		})
 		return
 	}
-	if !redeemCode.CanUse() {
-		errorCode := "activation_consumed"
-		if redeemCode.IsExpired() {
-			errorCode = "activation_expired"
+	if !service.CanUseClawXActivationRedeemCode(redeemCode) {
+		errorCode := "activation_invalid"
+		if !redeemCode.CanUse() {
+			errorCode = "activation_consumed"
+			if redeemCode.IsExpired() {
+				errorCode = "activation_expired"
+			}
 		}
 		response.Success(c, gin.H{
 			"valid":     false,
@@ -263,20 +271,55 @@ func (h *ClawXHandler) Register(c *gin.Context) {
 		return
 	}
 
-	_, user, err := h.authService.RegisterWithVerification(
+	user, err := h.authService.RegisterForClawX(
 		c.Request.Context(),
 		email,
 		req.Password,
 		strings.TrimSpace(req.VerifyCode),
-		"",
 		strings.TrimSpace(invitationCode),
-		"",
+		settings.ActivationRequired,
+		settings.DefaultGroupID,
 	)
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
 	}
 	h.writeAuthPayload(c, user, req.Device)
+}
+
+func (h *ClawXHandler) SendVerifyCode(c *gin.Context) {
+	settings := h.runtimeSettings(c)
+	if !settings.Enabled {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"code":    http.StatusServiceUnavailable,
+			"message": "server_disabled",
+			"reason":  "server_disabled",
+		})
+		return
+	}
+	if !settings.RegistrationEnabled {
+		response.Forbidden(c, "registration is disabled")
+		return
+	}
+	var req clawXSendVerifyCodeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+	email := normalizeClawXAccount(req.Email, req.Account)
+	if email == "" {
+		response.BadRequest(c, "email is required")
+		return
+	}
+	result, err := h.authService.SendVerifyCodeAsync(c.Request.Context(), email, c.GetHeader("Accept-Language"))
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, gin.H{
+		"message":   "Verification code sent successfully",
+		"countdown": result.Countdown,
+	})
 }
 
 func (h *ClawXHandler) Login(c *gin.Context) {
@@ -365,6 +408,13 @@ func (h *ClawXHandler) RelayToken(c *gin.Context) {
 	if existing != nil {
 		response.Success(c, h.relayTokenPayload(settings, existing.Key))
 		return
+	}
+
+	if settings.DefaultGroupID != nil && *settings.DefaultGroupID > 0 {
+		if err := h.userService.AddGroupToAllowedGroups(c.Request.Context(), subject.UserID, *settings.DefaultGroupID); err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
 	}
 
 	key, err := h.apiKeyService.Create(c.Request.Context(), subject.UserID, service.CreateAPIKeyRequest{

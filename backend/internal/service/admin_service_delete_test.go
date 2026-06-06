@@ -22,6 +22,16 @@ type userRepoStub struct {
 	nextID        int64
 	created       []*User
 	updated       []*User
+	allowBalanceUpdate bool
+	balanceUpdates []struct {
+		id     int64
+		amount float64
+	}
+	allowConcurrencyUpdate bool
+	concurrencyUpdates []struct {
+		id     int64
+		amount int
+	}
 	deletedIDs    []int64
 	usersByEmail  map[string]*User
 	getByEmailErr error
@@ -120,7 +130,14 @@ func (s *userRepoStub) UpdateUserLastActiveAt(ctx context.Context, userID int64,
 }
 
 func (s *userRepoStub) UpdateBalance(ctx context.Context, id int64, amount float64) error {
-	panic("unexpected UpdateBalance call")
+	if !s.allowBalanceUpdate {
+		panic("unexpected UpdateBalance call")
+	}
+	s.balanceUpdates = append(s.balanceUpdates, struct {
+		id     int64
+		amount float64
+	}{id: id, amount: amount})
+	return nil
 }
 
 func (s *userRepoStub) DeductBalance(ctx context.Context, id int64, amount float64) error {
@@ -128,7 +145,14 @@ func (s *userRepoStub) DeductBalance(ctx context.Context, id int64, amount float
 }
 
 func (s *userRepoStub) UpdateConcurrency(ctx context.Context, id int64, amount int) error {
-	panic("unexpected UpdateConcurrency call")
+	if !s.allowConcurrencyUpdate {
+		panic("unexpected UpdateConcurrency call")
+	}
+	s.concurrencyUpdates = append(s.concurrencyUpdates, struct {
+		id     int64
+		amount int
+	}{id: id, amount: amount})
+	return nil
 }
 
 func (s *userRepoStub) BatchSetConcurrency(context.Context, []int64, int) (int, error) { return 0, nil }

@@ -472,6 +472,55 @@ func TestAuthService_Register_Success(t *testing.T) {
 	require.True(t, user.CheckPassword("password"))
 }
 
+func TestAuthService_RegisterForClawX_AppliesBalanceActivationCode(t *testing.T) {
+	repo := &userRepoStub{nextID: 81, allowBalanceUpdate: true}
+	redeemRepo := &redeemCodeRepoStub{
+		codesByCode: map[string]*RedeemCode{
+			"BALANCE143": {
+				ID:     9,
+				Code:   "BALANCE143",
+				Type:   RedeemTypeBalance,
+				Value:  143,
+				Status: StatusUnused,
+			},
+		},
+	}
+	emailCache := &emailCacheStub{
+		data: &VerificationCodeData{
+			Code:      "135790",
+			Attempts:  0,
+			CreatedAt: time.Now().UTC(),
+			ExpiresAt: time.Now().UTC().Add(15 * time.Minute),
+		},
+	}
+	service := newAuthService(repo, map[string]string{
+		SettingKeyRegistrationEnabled: "true",
+		SettingKeyEmailVerifyEnabled:  "true",
+	}, emailCache, nil)
+	service.redeemRepo = redeemRepo
+
+	user, err := service.RegisterForClawX(
+		context.Background(),
+		"clawx-balance@test.com",
+		"password",
+		"135790",
+		"BALANCE143",
+		true,
+		nil,
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, user)
+	require.Equal(t, int64(81), user.ID)
+	require.Equal(t, 146.5, user.Balance)
+	require.Len(t, repo.balanceUpdates, 1)
+	require.Equal(t, int64(81), repo.balanceUpdates[0].id)
+	require.Equal(t, 143.0, repo.balanceUpdates[0].amount)
+	require.Len(t, redeemRepo.useCalls, 1)
+	require.Equal(t, int64(9), redeemRepo.useCalls[0].id)
+	require.Equal(t, int64(81), redeemRepo.useCalls[0].userID)
+}
+
 func TestAuthService_ValidateToken_ExpiredReturnsClaimsWithError(t *testing.T) {
 	repo := &userRepoStub{}
 	service := newAuthService(repo, nil, nil, nil)

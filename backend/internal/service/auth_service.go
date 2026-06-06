@@ -133,6 +133,197 @@ func (s *AuthService) Register(ctx context.Context, email, password string) (str
 	return s.RegisterWithVerification(ctx, email, password, "", "", "", "")
 }
 
+// RegisterForClawX creates a local user for the ClawX managed-client flow.
+// ClawX activation reuses Sub2API redeem codes; account creation still requires
+// email verification.
+func (s *AuthService) RegisterForClawX(ctx context.Context, email, password, verifyCode, activationCode string, activationRequired bool, defaultGroupID *int64) (*User, error) {
+	if s.settingService == nil || !s.settingService.IsRegistrationEnabled(ctx) {
+		return nil, ErrRegDisabled
+	}
+	if isReservedEmail(email) {
+		return nil, ErrEmailReserved
+	}
+	if err := s.validateRegistrationEmailPolicy(ctx, email); err != nil {
+		return nil, err
+	}
+
+	var activationRedeemCode *RedeemCode
+	activationCode = strings.TrimSpace(activationCode)
+	if activationCode == "" {
+		if activationRequired {
+			return nil, ErrInvitationCodeRequired
+		}
+	} else {
+		if s.redeemRepo == nil {
+			return nil, ErrInvitationCodeInvalid
+		}
+		redeemCode, redeemErr := s.redeemRepo.GetByCode(ctx, activationCode)
+		if redeemErr != nil {
+			logger.LegacyPrintf("service.auth", "[ClawX] Invalid activation code: %s, error: %v", activationCode, redeemErr)
+			return nil, ErrInvitationCodeInvalid
+		}
+		activationRedeemCode = redeemCode
+		if !CanUseClawXActivationRedeemCode(activationRedeemCode) {
+			logger.LegacyPrintf("service.auth", "[ClawX] Activation code invalid: type=%s, status=%s", activationRedeemCode.Type, activationRedeemCode.Status)
+			return nil, ErrInvitationCodeInvalid
+		}
+	}
+
+	if s.emailService == nil {
+		logger.LegacyPrintf("service.auth", "%s", "[ClawX] Email verification required but email service not configured")
+		return nil, ErrServiceUnavailable
+	}
+	if strings.TrimSpace(verifyCode) == "" {
+		return nil, ErrEmailVerifyRequired
+	}
+	if err := s.emailService.VerifyCode(ctx, email, verifyCode); err != nil {
+		return nil, fmt.Errorf("verify code: %w", err)
+	}
+
+	existsEmail, err := s.userRepo.ExistsByEmail(ctx, email)
+	if err != nil {
+		logger.LegacyPrintf("service.auth", "[ClawX] Database error checking email exists: %v", err)
+		return nil, ErrServiceUnavailable
+	}
+	if existsEmail {
+		return nil, ErrEmailExists
+	}
+
+	hashedPassword, err := s.HashPassword(password)
+	if err != nil {
+		return nil, fmt.Errorf("hash password: %w", err)
+	}
+
+	grantPlan := s.resolveSignupGrantPlan(ctx, "email")
+	var defaultRPMLimit int
+	if s.settingService != nil {
+		defaultRPMLimit = s.settingService.GetDefaultUserRPMLimit(ctx)
+	}
+
+	user := &User{
+		Email:        email,
+		PasswordHash: hashedPassword,
+		Role:         RoleUser,
+		Balance:      grantPlan.Balance,
+		Concurrency:  grantPlan.Concurrency,
+		RPMLimit:     defaultRPMLimit,
+		Status:       StatusActive,
+		SignupSource: "email",
+	}
+	if defaultGroupID != nil && *defaultGroupID > 0 {
+		user.AllowedGroups = []int64{*defaultGroupID}
+	}
+
+	createCtx := ctx
+	var tx *dbent.Tx
+	if s.entClient != nil {
+		var txErr error
+		tx, txErr = s.entClient.Tx(ctx)
+		if txErr != nil {
+			logger.LegacyPrintf("service.auth", "[ClawX] Failed to begin registration transaction: %v", txErr)
+			return nil, ErrServiceUnavailable
+		}
+		defer func() { _ = tx.Rollback() }()
+		createCtx = dbent.NewTxContext(ctx, tx)
+	}
+
+	if err := s.userRepo.Create(createCtx, user); err != nil {
+		if errors.Is(err, ErrEmailExists) {
+			return nil, ErrEmailExists
+		}
+		logger.LegacyPrintf("service.auth", "[ClawX] Database error creating user: %v", err)
+		return nil, ErrServiceUnavailable
+	}
+
+	if activationRedeemCode != nil {
+		if err := s.redeemRepo.Use(createCtx, activationRedeemCode.ID, user.ID); err != nil {
+			logger.LegacyPrintf("service.auth", "[ClawX] Failed to mark activation code as used for user %d: %v", user.ID, err)
+			return nil, ErrInvitationCodeInvalid
+		}
+		if err := s.applyClawXActivationRedeemCode(createCtx, user, activationRedeemCode); err != nil {
+			logger.LegacyPrintf("service.auth", "[ClawX] Failed to apply activation code for user %d: %v", user.ID, err)
+			return nil, err
+		}
+	}
+	if tx != nil {
+		if err := tx.Commit(); err != nil {
+			logger.LegacyPrintf("service.auth", "[ClawX] Failed to commit registration transaction: %v", err)
+			return nil, ErrServiceUnavailable
+		}
+	}
+
+	s.postAuthUserBootstrap(ctx, user, "email", true)
+	s.assignSubscriptions(ctx, user.ID, grantPlan.Subscriptions, "auto assigned by clawx signup")
+	_ = s.snapshotPlatformQuotaDefaults(ctx, user.ID, &grantPlan)
+	if s.affiliateService != nil {
+		if _, err := s.affiliateService.EnsureUserAffiliate(ctx, user.ID); err != nil {
+			logger.LegacyPrintf("service.auth", "[ClawX] Failed to initialize affiliate profile for user %d: %v", user.ID, err)
+		}
+	}
+
+	return user, nil
+}
+
+func CanUseClawXActivationRedeemCode(code *RedeemCode) bool {
+	if code == nil || !code.CanUse() {
+		return false
+	}
+	switch code.Type {
+	case RedeemTypeBalance, RedeemTypeConcurrency:
+		return code.Value > 0
+	case RedeemTypeInvitation:
+		return true
+	case RedeemTypeSubscription:
+		return code.GroupID != nil && *code.GroupID > 0 && code.ValidityDays >= 0
+	default:
+		return false
+	}
+}
+
+func (s *AuthService) applyClawXActivationRedeemCode(ctx context.Context, user *User, code *RedeemCode) error {
+	if user == nil || code == nil {
+		return nil
+	}
+	switch code.Type {
+	case RedeemTypeBalance:
+		if err := s.userRepo.UpdateBalance(ctx, user.ID, code.Value); err != nil {
+			return fmt.Errorf("update user balance: %w", err)
+		}
+		user.Balance += code.Value
+	case RedeemTypeConcurrency:
+		delta := int(code.Value)
+		if err := s.userRepo.UpdateConcurrency(ctx, user.ID, delta); err != nil {
+			return fmt.Errorf("update user concurrency: %w", err)
+		}
+		user.Concurrency += delta
+	case RedeemTypeSubscription:
+		if code.GroupID == nil || *code.GroupID <= 0 {
+			return infraerrors.BadRequest("REDEEM_CODE_INVALID", "invalid subscription redeem code: missing group_id")
+		}
+		if s.defaultSubAssigner == nil {
+			return ErrServiceUnavailable
+		}
+		validityDays := code.ValidityDays
+		if validityDays <= 0 {
+			validityDays = 30
+		}
+		if _, _, err := s.defaultSubAssigner.AssignOrExtendSubscription(ctx, &AssignSubscriptionInput{
+			UserID:       user.ID,
+			GroupID:      *code.GroupID,
+			ValidityDays: validityDays,
+			AssignedBy:   0,
+			Notes:        fmt.Sprintf("activated by ClawX code %s", code.Code),
+		}); err != nil {
+			return fmt.Errorf("assign or extend subscription: %w", err)
+		}
+	case RedeemTypeInvitation:
+		return nil
+	default:
+		return infraerrors.BadRequest("REDEEM_CODE_INVALID", fmt.Sprintf("unsupported activation redeem type: %s", code.Type))
+	}
+	return nil
+}
+
 // RegisterWithVerification 用户注册（支持邮件验证、优惠码、邀请码和邀请返利码），返回token和用户。
 func (s *AuthService) RegisterWithVerification(ctx context.Context, email, password, verifyCode, promoCode, invitationCode, affiliateCode string) (string, *User, error) {
 	// 检查是否开放注册（默认关闭：settingService 未配置时不允许注册）

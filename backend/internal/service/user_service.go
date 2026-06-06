@@ -969,6 +969,22 @@ func (s *UserService) GetByID(ctx context.Context, id int64) (*User, error) {
 	return user, nil
 }
 
+func (s *UserService) AddGroupToAllowedGroups(ctx context.Context, userID int64, groupID int64) error {
+	if s == nil || s.userRepo == nil {
+		return ErrServiceUnavailable
+	}
+	if userID <= 0 || groupID <= 0 {
+		return nil
+	}
+	if err := s.userRepo.AddGroupToAllowedGroups(ctx, userID, groupID); err != nil {
+		return fmt.Errorf("add group to allowed groups: %w", err)
+	}
+	if s.authCacheInvalidator != nil {
+		s.authCacheInvalidator.InvalidateAuthCacheByUserID(ctx, userID)
+	}
+	return nil
+}
+
 func normalizeLoadedUserTokenVersion(user *User) {
 	if user == nil || user.TokenVersionResolved {
 		return
