@@ -1,0 +1,74 @@
+name: Publish DockerHub Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build
+        required: true
+        type: string
+        default: feature/clawx-junfeiai-compat
+      image:
+        description: DockerHub image repository
+        required: true
+        type: string
+        default: 401825317/sub2api
+      tag:
+        description: Docker image tag
+        required: true
+        type: string
+        default: clawx-20260606-ce2ed1a9
+      platforms:
+        description: Target platform list
+        required: true
+        type: string
+        default: linux/amd64
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout selected ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Resolve build metadata
+        id: meta
+        shell: bash
+        run: |
+          echo "commit=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: docker.io/${{ inputs.image }}:${{ inputs.tag }}
+          build-args: |
+            VERSION=${{ inputs.tag }}
+            COMMIT=${{ steps.meta.outputs.commit }}
+            DATE=${{ steps.meta.outputs.date }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.commit }}
+            org.opencontainers.image.version=${{ inputs.tag }}
+
+      - name: Print image
+        run: echo "Published docker.io/${{ inputs.image }}:${{ inputs.tag }}"
