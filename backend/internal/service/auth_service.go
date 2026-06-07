@@ -169,15 +169,17 @@ func (s *AuthService) RegisterForClawX(ctx context.Context, email, password, ver
 		}
 	}
 
-	if s.emailService == nil {
-		logger.LegacyPrintf("service.auth", "%s", "[ClawX] Email verification required but email service not configured")
-		return nil, ErrServiceUnavailable
-	}
-	if strings.TrimSpace(verifyCode) == "" {
-		return nil, ErrEmailVerifyRequired
-	}
-	if err := s.emailService.VerifyCode(ctx, email, verifyCode); err != nil {
-		return nil, fmt.Errorf("verify code: %w", err)
+	if s.settingService != nil && s.settingService.IsEmailVerifyEnabled(ctx) {
+		if s.emailService == nil {
+			logger.LegacyPrintf("service.auth", "%s", "[ClawX] Email verification enabled but email service not configured")
+			return nil, ErrServiceUnavailable
+		}
+		if strings.TrimSpace(verifyCode) == "" {
+			return nil, ErrEmailVerifyRequired
+		}
+		if err := s.emailService.VerifyCode(ctx, email, verifyCode); err != nil {
+			return nil, fmt.Errorf("verify code: %w", err)
+		}
 	}
 
 	existsEmail, err := s.userRepo.ExistsByEmail(ctx, email)

@@ -521,6 +521,46 @@ func TestAuthService_RegisterForClawX_AppliesBalanceActivationCode(t *testing.T)
 	require.Equal(t, int64(81), redeemRepo.useCalls[0].userID)
 }
 
+func TestAuthService_RegisterForClawX_DoesNotRequireEmailVerifyWhenDisabled(t *testing.T) {
+	repo := &userRepoStub{nextID: 91, allowBalanceUpdate: true}
+	redeemRepo := &redeemCodeRepoStub{
+		codesByCode: map[string]*RedeemCode{
+			"BALANCE50": {
+				ID:     10,
+				Code:   "BALANCE50",
+				Type:   RedeemTypeBalance,
+				Value:  50,
+				Status: StatusUnused,
+			},
+		},
+	}
+	service := newAuthService(repo, map[string]string{
+		SettingKeyRegistrationEnabled: "true",
+		SettingKeyEmailVerifyEnabled:  "false",
+	}, nil, nil)
+	service.redeemRepo = redeemRepo
+
+	user, err := service.RegisterForClawX(
+		context.Background(),
+		"clawx-no-verify@test.com",
+		"password",
+		"",
+		"BALANCE50",
+		true,
+		nil,
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, user)
+	require.Equal(t, int64(91), user.ID)
+	require.Equal(t, 53.5, user.Balance)
+	require.Len(t, repo.balanceUpdates, 1)
+	require.Equal(t, 50.0, repo.balanceUpdates[0].amount)
+	require.Len(t, redeemRepo.useCalls, 1)
+	require.Equal(t, int64(10), redeemRepo.useCalls[0].id)
+	require.Equal(t, int64(91), redeemRepo.useCalls[0].userID)
+}
+
 func TestAuthService_ValidateToken_ExpiredReturnsClaimsWithError(t *testing.T) {
 	repo := &userRepoStub{}
 	service := newAuthService(repo, nil, nil, nil)
