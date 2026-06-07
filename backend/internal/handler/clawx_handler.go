@@ -476,15 +476,18 @@ func (h *ClawXHandler) RelayToken(c *gin.Context) {
 		return
 	}
 	if existing != nil {
+		existing, err = h.bindRelayAPIKeyDefaultGroupIfNeeded(c, subject.UserID, existing, settings)
+		if err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
 		response.Success(c, h.relayTokenPayload(settings, existing.Key))
 		return
 	}
 
-	if settings.DefaultGroupID != nil && *settings.DefaultGroupID > 0 {
-		if err := h.userService.AddGroupToAllowedGroups(c.Request.Context(), subject.UserID, *settings.DefaultGroupID); err != nil {
-			response.ErrorFrom(c, err)
-			return
-		}
+	if err := h.ensureClawXDefaultGroupAccess(c, subject.UserID, settings); err != nil {
+		response.ErrorFrom(c, err)
+		return
 	}
 
 	key, err := h.apiKeyService.Create(c.Request.Context(), subject.UserID, service.CreateAPIKeyRequest{
@@ -496,6 +499,46 @@ func (h *ClawXHandler) RelayToken(c *gin.Context) {
 		return
 	}
 	response.Success(c, h.relayTokenPayload(settings, key.Key))
+}
+
+func (h *ClawXHandler) ensureClawXDefaultGroupAccess(c *gin.Context, userID int64, settings service.ClawXRuntimeSettings) error {
+	groupID, ok := clawXDefaultGroupID(settings)
+	if !ok {
+		return nil
+	}
+	return h.userService.AddGroupToAllowedGroups(c.Request.Context(), userID, groupID)
+}
+
+func (h *ClawXHandler) bindRelayAPIKeyDefaultGroupIfNeeded(c *gin.Context, userID int64, key *service.APIKey, settings service.ClawXRuntimeSettings) (*service.APIKey, error) {
+	groupID, _ := clawXDefaultGroupID(settings)
+	if !relayAPIKeyNeedsDefaultGroupBinding(key, settings) {
+		return key, nil
+	}
+	if err := h.ensureClawXDefaultGroupAccess(c, userID, settings); err != nil {
+		return nil, err
+	}
+	return h.apiKeyService.Update(c.Request.Context(), key.ID, userID, service.UpdateAPIKeyRequest{
+		GroupID:     &groupID,
+		IPWhitelist: key.IPWhitelist,
+		IPBlacklist: key.IPBlacklist,
+	})
+}
+
+func clawXDefaultGroupID(settings service.ClawXRuntimeSettings) (int64, bool) {
+	if settings.DefaultGroupID == nil || *settings.DefaultGroupID <= 0 {
+		return 0, false
+	}
+	return *settings.DefaultGroupID, true
+}
+
+func relayAPIKeyNeedsDefaultGroupBinding(key *service.APIKey, settings service.ClawXRuntimeSettings) bool {
+	if key == nil {
+		return false
+	}
+	if _, ok := clawXDefaultGroupID(settings); !ok {
+		return false
+	}
+	return key.GroupID == nil || *key.GroupID <= 0
 }
 
 func (h *ClawXHandler) UserSelf(c *gin.Context) {
