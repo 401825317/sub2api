@@ -10,6 +10,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
 )
 
@@ -211,6 +212,98 @@ func TestLogger_AccessLogUsesForwardedClientIP(t *testing.T) {
 	t.Fatalf("access log event not found")
 }
 
+func TestLogger_GPT55AccessLogIncludesDetailedTimingFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	sink := initMiddlewareTestLogger(t)
+
+	r := gin.New()
+	r.Use(Logger())
+	r.Use(func(c *gin.Context) {
+		ctx := c.Request.Context()
+		ctx = context.WithValue(ctx, ctxkey.AccountID, int64(94))
+		ctx = context.WithValue(ctx, ctxkey.Platform, "openai")
+		ctx = context.WithValue(ctx, ctxkey.Model, "gpt-5.5")
+		c.Request = c.Request.WithContext(ctx)
+		c.Set(service.OpsAuthLatencyMsKey, int64(11))
+		c.Set(service.OpsRoutingLatencyMsKey, int64(22))
+		c.Set(service.OpsUpstreamLatencyMsKey, int64(333))
+		c.Set(service.OpsResponseLatencyMsKey, int64(4444))
+		c.Set(service.OpsTimeToFirstTokenMsKey, int64(0))
+		c.Next()
+	})
+	r.POST("/v1/responses", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d", w.Code)
+	}
+
+	for _, event := range sink.list() {
+		if event == nil || event.Message != "http request completed" {
+			continue
+		}
+		if event.Fields["detailed_timing"] != true {
+			t.Fatalf("detailed_timing missing: %+v", event.Fields)
+		}
+		assertInt64Field(t, event.Fields, "auth_latency_ms", 11)
+		assertInt64Field(t, event.Fields, "routing_latency_ms", 22)
+		assertInt64Field(t, event.Fields, "upstream_latency_ms", 333)
+		assertInt64Field(t, event.Fields, "response_latency_ms", 4444)
+		assertInt64Field(t, event.Fields, "time_to_first_token_ms", 0)
+		if _, ok := event.Fields["after_first_token_ms"]; !ok {
+			t.Fatalf("after_first_token_ms missing: %+v", event.Fields)
+		}
+		if _, ok := event.Fields["total_latency_ms"]; !ok {
+			t.Fatalf("total_latency_ms missing: %+v", event.Fields)
+		}
+		return
+	}
+	t.Fatalf("access log event not found")
+}
+
+func TestLogger_DetailedTimingOnlyForGPT55(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	sink := initMiddlewareTestLogger(t)
+
+	r := gin.New()
+	r.Use(Logger())
+	r.Use(func(c *gin.Context) {
+		ctx := c.Request.Context()
+		ctx = context.WithValue(ctx, ctxkey.Model, "gpt-5.4")
+		c.Request = c.Request.WithContext(ctx)
+		c.Set(service.OpsAuthLatencyMsKey, int64(11))
+		c.Next()
+	})
+	r.POST("/v1/responses", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d", w.Code)
+	}
+
+	for _, event := range sink.list() {
+		if event == nil || event.Message != "http request completed" {
+			continue
+		}
+		if _, ok := event.Fields["detailed_timing"]; ok {
+			t.Fatalf("non-gpt-5.5 access log should not include detailed timing: %+v", event.Fields)
+		}
+		if _, ok := event.Fields["auth_latency_ms"]; ok {
+			t.Fatalf("non-gpt-5.5 access log should not include timing fields: %+v", event.Fields)
+		}
+		return
+	}
+	t.Fatalf("access log event not found")
+}
+
 func TestLogger_HealthPathSkipped(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	sink := initMiddlewareTestLogger(t)
@@ -229,6 +322,22 @@ func TestLogger_HealthPathSkipped(t *testing.T) {
 	}
 	if len(sink.list()) != 0 {
 		t.Fatalf("health endpoint should not write access log")
+	}
+}
+
+func assertInt64Field(t *testing.T, fields map[string]any, key string, want int64) {
+	t.Helper()
+	switch v := fields[key].(type) {
+	case int:
+		if int64(v) != want {
+			t.Fatalf("%s=%v, want %d", key, v, want)
+		}
+	case int64:
+		if v != want {
+			t.Fatalf("%s=%v, want %d", key, v, want)
+		}
+	default:
+		t.Fatalf("%s type mismatch: %T (%v)", key, v, v)
 	}
 }
 
