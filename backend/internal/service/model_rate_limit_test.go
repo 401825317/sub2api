@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
+	"github.com/stretchr/testify/require"
 )
 
 func TestIsModelRateLimited(t *testing.T) {
@@ -195,6 +196,36 @@ func TestIsModelRateLimited(t *testing.T) {
 			requestedModel: "claude-3-5-sonnet-20241022",
 			expected:       false,
 		},
+		{
+			name: "openai image generation family key blocks image model",
+			account: &Account{
+				Platform: PlatformOpenAI,
+				Extra: map[string]any{
+					modelRateLimitsKey: map[string]any{
+						openAIImageGenerationRateLimitKey: map[string]any{
+							"rate_limit_reset_at": future,
+						},
+					},
+				},
+			},
+			requestedModel: "gpt-image-2",
+			expected:       true,
+		},
+		{
+			name: "openai image generation family key does not block text model",
+			account: &Account{
+				Platform: PlatformOpenAI,
+				Extra: map[string]any{
+					modelRateLimitsKey: map[string]any{
+						openAIImageGenerationRateLimitKey: map[string]any{
+							"rate_limit_reset_at": future,
+						},
+					},
+				},
+			},
+			requestedModel: "gpt-5.4",
+			expected:       false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -205,6 +236,23 @@ func TestIsModelRateLimited(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIsModelRateLimited_OpenAIImageGenerationIntentBlocksTextModelImageTool(t *testing.T) {
+	future := time.Now().Add(10 * time.Minute).Format(time.RFC3339)
+	account := &Account{
+		Platform: PlatformOpenAI,
+		Extra: map[string]any{
+			modelRateLimitsKey: map[string]any{
+				openAIImageGenerationRateLimitKey: map[string]any{
+					"rate_limit_reset_at": future,
+				},
+			},
+		},
+	}
+
+	require.False(t, account.isModelRateLimitedWithContext(context.Background(), "gpt-5.4"))
+	require.True(t, account.isModelRateLimitedWithContext(WithOpenAIImageGenerationIntent(context.Background()), "gpt-5.4"))
 }
 
 func TestIsModelRateLimited_Antigravity_ThinkingAffectsModelKey(t *testing.T) {
@@ -450,4 +498,48 @@ func TestGetRateLimitRemainingTime(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIsModelRateLimited_AnthropicFableFamilyKey(t *testing.T) {
+	now := time.Now()
+	future := now.Add(48 * time.Hour).Format(time.RFC3339)
+
+	account := &Account{
+		Platform: PlatformAnthropic,
+		Extra: map[string]any{
+			modelRateLimitsKey: map[string]any{
+				anthropicFableRateLimitKey: map[string]any{
+					"rate_limit_reset_at": future,
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		requestedModel string
+		expected       bool
+	}{
+		{"claude-fable-5", true},
+		{"claude-fable-5[1m]", true},      // 家族 key 覆盖变体
+		{"Claude-Fable-5-20260601", true}, // 大小写不敏感
+		{"claude-sonnet-4-6", false},      // 其他模型不受影响
+		{"claude-opus-4-8", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.requestedModel, func(t *testing.T) {
+			got := account.isModelRateLimitedWithContext(context.Background(), tc.requestedModel)
+			require.Equal(t, tc.expected, got)
+			remaining := account.GetModelRateLimitRemainingTimeWithContext(context.Background(), tc.requestedModel)
+			require.Equal(t, tc.expected, remaining > 0)
+		})
+	}
+}
+
+func TestIsAnthropicFableModel(t *testing.T) {
+	require.True(t, isAnthropicFableModel("claude-fable-5"))
+	require.True(t, isAnthropicFableModel("claude-fable-5[1m]"))
+	require.True(t, isAnthropicFableModel("Claude-Fable-5"))
+	require.False(t, isAnthropicFableModel("claude-sonnet-4-6"))
+	require.False(t, isAnthropicFableModel(""))
 }
