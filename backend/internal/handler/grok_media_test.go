@@ -5,10 +5,35 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRetryGrokVideoCompletionBillingIsSynchronousAndBounded(t *testing.T) {
+	t.Parallel()
+
+	t.Run("retries until confirmed", func(t *testing.T) {
+		calls := 0
+		recorded := retryGrokVideoCompletionBilling(context.Background(), 3, time.Second, 0, func(context.Context) bool {
+			calls++
+			return calls == 3
+		})
+		require.True(t, recorded)
+		require.Equal(t, 3, calls)
+	})
+
+	t.Run("stops at attempt cap", func(t *testing.T) {
+		calls := 0
+		recorded := retryGrokVideoCompletionBilling(context.Background(), 2, time.Second, 0, func(context.Context) bool {
+			calls++
+			return false
+		})
+		require.False(t, recorded)
+		require.Equal(t, 2, calls)
+	})
+}
 
 type grokMediaEligibilityProberStub struct {
 	eligible bool

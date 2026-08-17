@@ -1,11 +1,55 @@
 package service
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+type grokVideoPendingOwnerCacheStub struct {
+	pending []byte
+}
+
+func (s *grokVideoPendingOwnerCacheStub) GetSessionAccountID(context.Context, int64, string) (int64, error) {
+	return 0, ErrStickySessionNotFound
+}
+
+func (s *grokVideoPendingOwnerCacheStub) SetSessionAccountID(context.Context, int64, string, int64, time.Duration) error {
+	return nil
+}
+
+func (s *grokVideoPendingOwnerCacheStub) RefreshSessionTTL(context.Context, int64, string, time.Duration) error {
+	return nil
+}
+
+func (s *grokVideoPendingOwnerCacheStub) DeleteSessionAccountID(context.Context, int64, string) error {
+	return nil
+}
+
+func (s *grokVideoPendingOwnerCacheStub) SetGrokVideoPendingBilling(_ context.Context, _ string, payload []byte, _ time.Duration) error {
+	s.pending = append([]byte(nil), payload...)
+	return nil
+}
+
+func (s *grokVideoPendingOwnerCacheStub) GetGrokVideoPendingBilling(context.Context, string) ([]byte, error) {
+	return append([]byte(nil), s.pending...), nil
+}
+
+func (s *grokVideoPendingOwnerCacheStub) ClaimGrokVideoBilled(context.Context, string, time.Duration) (bool, error) {
+	return true, nil
+}
+
+func (s *grokVideoPendingOwnerCacheStub) ReleaseGrokVideoBilled(context.Context, string) error {
+	return nil
+}
 
 func TestGrokVideoE2EDurationFromCreatedAt(t *testing.T) {
 	t.Parallel()
@@ -28,6 +72,67 @@ func TestGrokVideoPendingCreatedAtStampOnStoreShape(t *testing.T) {
 	d := GrokVideoE2EDuration(stamp, time.Now().UTC().Add(2*time.Second))
 	require.GreaterOrEqual(t, d, time.Second)
 	require.LessOrEqual(t, d, 3*time.Second)
+}
+
+func TestResolveGrokMediaVideoRequestAccountFallsBackToPendingOwner(t *testing.T) {
+	t.Parallel()
+	cache := &grokVideoPendingOwnerCacheStub{}
+	svc := &OpenAIGatewayService{cache: cache}
+	groupID := int64(17)
+	err := svc.StoreGrokVideoPendingBilling(context.Background(), "video-task", 23, 29, GrokVideoPendingBilling{
+		AccountID:            260,
+		Model:                "grok-imagine-video",
+		VideoResolution:      "720p",
+		VideoDurationSeconds: 6,
+	})
+	require.NoError(t, err)
+
+	accountID, err := svc.ResolveGrokMediaVideoRequestAccount(context.Background(), &groupID, "video-task", 23, 29)
+	require.NoError(t, err)
+	require.Equal(t, int64(260), accountID)
+}
+
+func TestSelectGrokMediaVideoRequestAccountUsesExactPendingOwner(t *testing.T) {
+	t.Parallel()
+	groupID := int64(17)
+	cache := &grokVideoPendingOwnerCacheStub{}
+	accounts := []Account{
+		{ID: 259, Platform: PlatformGrok, Status: StatusActive, Schedulable: true, GroupIDs: []int64{groupID}},
+		{ID: 260, Platform: PlatformGrok, Status: StatusActive, Schedulable: true, GroupIDs: []int64{groupID}},
+	}
+	svc := &OpenAIGatewayService{
+		accountRepo: stubOpenAIAccountRepo{accounts: accounts},
+		cache:       cache,
+	}
+	require.NoError(t, svc.StoreGrokVideoPendingBilling(context.Background(), "video-task", 23, 29, GrokVideoPendingBilling{
+		AccountID: 260,
+		Model:     "grok-imagine-video",
+	}))
+	ownerID, err := svc.ResolveGrokMediaVideoRequestAccount(context.Background(), &groupID, "video-task", 23, 29)
+	require.NoError(t, err)
+	require.Equal(t, int64(260), ownerID)
+
+	selection, err := svc.SelectGrokMediaVideoRequestAccount(context.Background(), &groupID, ownerID)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, int64(260), selection.Account.ID)
+	require.True(t, selection.Acquired)
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+}
+
+func TestIsGrokVideoPendingInStartupWindow(t *testing.T) {
+	t.Parallel()
+	now := time.Now().UTC()
+	require.True(t, IsGrokVideoPendingInStartupWindow(&GrokVideoPendingBilling{
+		CreatedAt: now.Add(-2 * time.Second).Format(time.RFC3339Nano),
+	}, now))
+	require.False(t, IsGrokVideoPendingInStartupWindow(&GrokVideoPendingBilling{
+		CreatedAt: now.Add(-13 * time.Second).Format(time.RFC3339Nano),
+	}, now))
+	require.False(t, IsGrokVideoPendingInStartupWindow(&GrokVideoPendingBilling{CreatedAt: "invalid"}, now))
 }
 
 func TestIsGrokVideoStatusBillable(t *testing.T) {
@@ -120,6 +225,114 @@ func TestGrokMediaUsageFromResponseVideoCreateDoesNotBill(t *testing.T) {
 	require.Equal(t, VideoBillingResolution720P, meta.VideoResolution)
 }
 
+func TestForwardGrokMediaWithBeforeResponsePersistsBeforeCommit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := []byte(`{"model":"grok-imagine-video","prompt":"waves","duration":6}`)
+	account := &Account{
+		ID:          63,
+		Platform:    PlatformGrok,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key":  "api-key",
+			"base_url": "https://api.x.ai/v1",
+		},
+	}
+
+	t.Run("callback runs before downstream write", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos/generations", bytes.NewReader(body))
+		upstream := &httpUpstreamRecorder{resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewBufferString(`{"request_id":"video-task-123"}`)),
+		}}
+		svc := &OpenAIGatewayService{httpUpstream: upstream}
+		callbackCalled := false
+
+		result, err := svc.ForwardGrokMediaWithBeforeResponse(
+			context.Background(), c, account, GrokMediaEndpointVideosGenerations, "", body, "application/json",
+			func(result *OpenAIForwardResult) error {
+				callbackCalled = true
+				require.Empty(t, recorder.Body.String())
+				require.Equal(t, "video-task-123", result.ResponseID)
+				return nil
+			},
+		)
+
+		require.NoError(t, err)
+		require.True(t, callbackCalled)
+		require.Equal(t, "video-task-123", result.ResponseID)
+		require.JSONEq(t, `{"request_id":"video-task-123"}`, recorder.Body.String())
+	})
+
+	t.Run("callback failure leaves downstream uncommitted", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos/generations", bytes.NewReader(body))
+		upstream := &httpUpstreamRecorder{resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewBufferString(`{"request_id":"video-task-456"}`)),
+		}}
+		svc := &OpenAIGatewayService{httpUpstream: upstream}
+
+		result, err := svc.ForwardGrokMediaWithBeforeResponse(
+			context.Background(), c, account, GrokMediaEndpointVideosGenerations, "", body, "application/json",
+			func(*OpenAIForwardResult) error { return errors.New("redis unavailable") },
+		)
+
+		require.ErrorContains(t, err, "prepare grok media response state")
+		require.Nil(t, result)
+		require.Empty(t, recorder.Body.String())
+	})
+}
+
+func TestForwardGrokMediaRecentStatusNotFoundReturnsPendingAfterBoundedRetries(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/videos/video-task-404", nil)
+	responses := make([]*http.Response, 0, grokVideoStartupNotFoundMaxAttempts)
+	for i := 0; i < grokVideoStartupNotFoundMaxAttempts; i++ {
+		responses = append(responses, &http.Response{
+			StatusCode: http.StatusNotFound,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewBufferString(`{"error":{"message":"not registered yet"}}`)),
+		})
+	}
+	upstream := &httpUpstreamRecorder{responses: responses}
+	svc := &OpenAIGatewayService{httpUpstream: upstream}
+	account := &Account{
+		ID:          260,
+		Platform:    PlatformGrok,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key":  "api-key",
+			"base_url": "https://api.x.ai/v1",
+		},
+	}
+
+	result, err := svc.ForwardGrokMedia(
+		WithGrokVideoStartupNotFoundFallback(context.Background()),
+		c,
+		account,
+		GrokMediaEndpointVideoStatus,
+		"video-task-404",
+		nil,
+		"",
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "video-task-404", result.ResponseID)
+	require.Len(t, upstream.requests, grokVideoStartupNotFoundMaxAttempts)
+	require.Equal(t, http.StatusAccepted, recorder.Code)
+	require.JSONEq(t, `{"request_id":"video-task-404","status":"pending"}`, recorder.Body.String())
+}
+
 func TestGrokMediaUsageFromResponseVideoStatusBillsOnOfficialDone(t *testing.T) {
 	t.Parallel()
 	meta := grokMediaUsageFromResponse(
@@ -146,4 +359,152 @@ func TestGrokMediaUsageFromResponseVideoStatusBillsOnOfficialDone(t *testing.T) 
 		[]byte(`{"status":"completed","video":{"url":"https://vidgen.x.ai/a.mp4","duration":9}}`),
 	)
 	require.Equal(t, 0, completed.VideoCount)
+}
+
+func TestObserveGrokVideoCompletionPendingThenDone(t *testing.T) {
+	t.Parallel()
+	options := grokVideoCompletionObserverOptions{
+		MaxDuration:         time.Second,
+		MaxAttempts:         5,
+		MaxConsecutive404:   3,
+		NotFoundRetryWindow: time.Second,
+	}
+	var fetchCalls int
+	var billed *OpenAIForwardResult
+	err := observeGrokVideoCompletion(context.Background(), options, func(context.Context) (*grokVideoStatusObservation, error) {
+		fetchCalls++
+		if fetchCalls == 1 {
+			return &grokVideoStatusObservation{HTTPStatus: http.StatusOK, Status: "pending"}, nil
+		}
+		return &grokVideoStatusObservation{
+			HTTPStatus: http.StatusOK,
+			Status:     "done",
+			Result:     &OpenAIForwardResult{ResponseID: "video-task", VideoCount: 1},
+		}, nil
+	}, func(result *OpenAIForwardResult) {
+		billed = result
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 2, fetchCalls)
+	require.NotNil(t, billed)
+	require.Equal(t, "video-task", billed.ResponseID)
+}
+
+func TestObserveGrokVideoCompletionStopsOnTerminalStates(t *testing.T) {
+	t.Parallel()
+	for _, status := range []string{"done", "failed", "expired"} {
+		status := status
+		t.Run(status, func(t *testing.T) {
+			t.Parallel()
+			fetchCalls := 0
+			billCalls := 0
+			err := observeGrokVideoCompletion(context.Background(), grokVideoCompletionObserverOptions{
+				MaxDuration:         time.Second,
+				MaxAttempts:         5,
+				MaxConsecutive404:   3,
+				NotFoundRetryWindow: time.Second,
+			}, func(context.Context) (*grokVideoStatusObservation, error) {
+				fetchCalls++
+				// done without video.url produces no billable Result and must still stop.
+				return &grokVideoStatusObservation{HTTPStatus: http.StatusOK, Status: status}, nil
+			}, func(*OpenAIForwardResult) {
+				billCalls++
+			})
+
+			require.NoError(t, err)
+			require.Equal(t, 1, fetchCalls)
+			require.Zero(t, billCalls)
+		})
+	}
+}
+
+func TestObserveGrokVideoCompletionStopsAfterConsecutiveNotFound(t *testing.T) {
+	t.Parallel()
+	options := grokVideoCompletionObserverOptions{
+		MaxDuration:         time.Second,
+		MaxAttempts:         10,
+		MaxConsecutive404:   3,
+		NotFoundRetryWindow: time.Second,
+	}
+	var fetchCalls int
+	err := observeGrokVideoCompletion(context.Background(), options, func(context.Context) (*grokVideoStatusObservation, error) {
+		fetchCalls++
+		return &grokVideoStatusObservation{HTTPStatus: http.StatusNotFound}, nil
+	}, nil)
+
+	require.NoError(t, err)
+	require.Equal(t, 3, fetchCalls)
+}
+
+func TestDefaultObserveGrokVideoNotFoundRetriesCoverStartupWindow(t *testing.T) {
+	t.Parallel()
+	require.GreaterOrEqual(t,
+		time.Duration(defaultGrokVideoObserverMaxConsecutive404-1)*defaultGrokVideoObserverPollInterval,
+		defaultGrokVideoObserverNotFoundRetryWindow,
+	)
+}
+
+func TestFetchGrokVideoStatusObservationRespectsAccountConcurrency(t *testing.T) {
+	t.Parallel()
+	upstream := &httpUpstreamRecorder{}
+	svc := &OpenAIGatewayService{
+		httpUpstream: upstream,
+		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{
+			acquireResults: map[int64]bool{260: false},
+		}),
+	}
+	account := &Account{
+		ID:          260,
+		Platform:    PlatformGrok,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key":  "api-key",
+			"base_url": "https://api.x.ai/v1",
+		},
+	}
+
+	observation, err := svc.fetchGrokVideoStatusObservation(context.Background(), account, "video-task")
+
+	require.Nil(t, observation)
+	require.ErrorContains(t, err, "account concurrency is full")
+	require.Empty(t, upstream.requests)
+}
+
+func TestObserveGrokVideoCompletionDoesNotRetryNotFoundOutsideStartupWindow(t *testing.T) {
+	t.Parallel()
+	options := grokVideoCompletionObserverOptions{
+		MaxDuration:         time.Second,
+		MaxAttempts:         10,
+		MaxConsecutive404:   3,
+		NotFoundRetryWindow: time.Nanosecond,
+	}
+	var fetchCalls int
+	err := observeGrokVideoCompletion(context.Background(), options, func(context.Context) (*grokVideoStatusObservation, error) {
+		fetchCalls++
+		time.Sleep(time.Millisecond)
+		return &grokVideoStatusObservation{HTTPStatus: http.StatusNotFound}, nil
+	}, nil)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, fetchCalls)
+}
+
+func TestObserveGrokVideoCompletionCapsPendingPolls(t *testing.T) {
+	t.Parallel()
+	options := grokVideoCompletionObserverOptions{
+		MaxDuration:         time.Second,
+		MaxAttempts:         4,
+		MaxConsecutive404:   3,
+		NotFoundRetryWindow: time.Second,
+	}
+	var fetchCalls int
+	err := observeGrokVideoCompletion(context.Background(), options, func(context.Context) (*grokVideoStatusObservation, error) {
+		fetchCalls++
+		return &grokVideoStatusObservation{HTTPStatus: http.StatusOK, Status: "pending"}, nil
+	}, nil)
+
+	require.NoError(t, err)
+	require.Equal(t, 4, fetchCalls)
 }

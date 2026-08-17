@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -322,13 +323,84 @@ func (s *OpenAIGatewayService) ResolveGrokMediaVideoRequestAccount(
 	if cacheKey == "" {
 		return 0, fmt.Errorf("grok video request binding is invalid")
 	}
-	return s.cache.GetSessionAccountID(ctx, derefGroupID(groupID), cacheKey)
+	accountID, err := s.cache.GetSessionAccountID(ctx, derefGroupID(groupID), cacheKey)
+	if err == nil && accountID > 0 {
+		return accountID, nil
+	}
+	if err != nil && !errors.Is(err, ErrStickySessionNotFound) {
+		return 0, err
+	}
+
+	// The pending record is written before the create response is exposed to the
+	// client and carries the same owner account. It is the durable fallback when
+	// the auxiliary sticky binding expired or its write failed after pending was
+	// committed, avoiding a false 404 for an otherwise valid task.
+	pending, pendingErr := s.LoadGrokVideoPendingBilling(ctx, requestID, userID, apiKeyID)
+	if pendingErr != nil {
+		return 0, pendingErr
+	}
+	if pending != nil && pending.AccountID > 0 {
+		return pending.AccountID, nil
+	}
+	return 0, nil
+}
+
+// SelectGrokMediaVideoRequestAccount selects exactly the account that accepted
+// an asynchronous video task. Status/content lookups must never load-balance to
+// another Grok account because upstream task ids are account-scoped.
+func (s *OpenAIGatewayService) SelectGrokMediaVideoRequestAccount(
+	ctx context.Context,
+	groupID *int64,
+	accountID int64,
+) (*AccountSelectionResult, error) {
+	if s == nil || s.accountRepo == nil || accountID <= 0 {
+		return nil, ErrNoAvailableAccounts
+	}
+	account, err := s.accountRepo.GetByID(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	// Lookup only needs the credential that owns the existing task. Temporary
+	// generation quota/rate-limit gates must not hide an already-created task.
+	if account == nil || !account.IsActive() || !account.IsGrok() ||
+		!s.openAIAccountMatchesSchedulingGroup(account, groupID) {
+		return nil, ErrNoAvailableAccounts
+	}
+
+	acquired, acquireErr := s.tryAcquireAccountSlot(ctx, account.ID, account.Concurrency)
+	if acquireErr == nil && acquired != nil && acquired.Acquired {
+		return &AccountSelectionResult{
+			Account:     account,
+			Acquired:    true,
+			ReleaseFunc: acquired.ReleaseFunc,
+		}, nil
+	}
+	if s.concurrencyService == nil {
+		if acquireErr != nil {
+			return nil, acquireErr
+		}
+		return nil, ErrNoAvailableAccounts
+	}
+	cfg := s.schedulingConfig()
+	return &AccountSelectionResult{
+		Account: account,
+		WaitPlan: &AccountWaitPlan{
+			AccountID:      account.ID,
+			MaxConcurrency: account.Concurrency,
+			Timeout:        cfg.StickySessionWaitTimeout,
+			MaxWaiting:     cfg.StickySessionMaxWaiting,
+		},
+	}, nil
 }
 
 // GrokVideoPendingBilling is the create-time snapshot used when status polling
 // first observes a completed video URL. Status may omit model/duration; we fall
 // back to this snapshot, then defaults.
 type GrokVideoPendingBilling struct {
+	// AccountID pins status/content lookups to the upstream account that accepted
+	// the task. It also serves as the owner-binding fallback when the separate
+	// sticky-session key is absent.
+	AccountID            int64  `json:"account_id,omitempty"`
 	Model                string `json:"model"`
 	BillingModel         string `json:"billing_model,omitempty"`
 	UpstreamModel        string `json:"upstream_model,omitempty"`
@@ -372,6 +444,42 @@ func GrokVideoE2EDuration(createdAt string, discoveredAt time.Time) time.Duratio
 		return 0
 	}
 	return d
+}
+
+const grokVideoStartupNotFoundWindow = 12 * time.Second
+
+const (
+	grokVideoStartupNotFoundMaxAttempts = 3
+	grokVideoStartupNotFoundRetryDelay  = 250 * time.Millisecond
+)
+
+// IsGrokVideoPendingInStartupWindow reports whether a task was accepted recently
+// enough that the provider's status endpoint may still be registering its id.
+func IsGrokVideoPendingInStartupWindow(pending *GrokVideoPendingBilling, now time.Time) bool {
+	if pending == nil || strings.TrimSpace(pending.CreatedAt) == "" {
+		return false
+	}
+	age := GrokVideoE2EDuration(pending.CreatedAt, now)
+	return age > 0 && age <= grokVideoStartupNotFoundWindow
+}
+
+type grokVideoStartupNotFoundContextKey struct{}
+
+// WithGrokVideoStartupNotFoundFallback enables the short create/status
+// registration-race fallback for a recently persisted task.
+func WithGrokVideoStartupNotFoundFallback(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, grokVideoStartupNotFoundContextKey{}, true)
+}
+
+func grokVideoStartupNotFoundFallbackEnabled(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	enabled, _ := ctx.Value(grokVideoStartupNotFoundContextKey{}).(bool)
+	return enabled
 }
 
 func grokVideoPendingBillingKey(requestID string, userID, apiKeyID int64) string {
@@ -597,6 +705,246 @@ func ExtractGrokVideoBillingFromStatusBody(statusBody []byte, pending *GrokVideo
 	}
 }
 
+const (
+	defaultGrokVideoObserverInitialDelay        = time.Second
+	defaultGrokVideoObserverPollInterval        = 3 * time.Second
+	defaultGrokVideoObserverRequestTimeout      = 15 * time.Second
+	defaultGrokVideoObserverMaxDuration         = 15 * time.Minute
+	defaultGrokVideoObserverMaxAttempts         = 300
+	defaultGrokVideoObserverMaxConsecutive404   = 5
+	defaultGrokVideoObserverNotFoundRetryWindow = 12 * time.Second
+	defaultGrokVideoObserverRequestConcurrency  = 32
+)
+
+var grokVideoObserverRequestSlots = make(chan struct{}, defaultGrokVideoObserverRequestConcurrency)
+
+type grokVideoCompletionObserverOptions struct {
+	InitialDelay        time.Duration
+	PollInterval        time.Duration
+	RequestTimeout      time.Duration
+	MaxDuration         time.Duration
+	MaxAttempts         int
+	MaxConsecutive404   int
+	NotFoundRetryWindow time.Duration
+}
+
+type grokVideoStatusObservation struct {
+	HTTPStatus int
+	Status     string
+	Result     *OpenAIForwardResult
+}
+
+type grokVideoStatusFetchFunc func(context.Context) (*grokVideoStatusObservation, error)
+
+// ObserveGrokVideoCompletion performs a bounded, best-effort completion watch
+// after an async create response. It stops on all official terminal states and
+// uses a short, capped retry window for the provider's transient create/status
+// registration 404. Billing remains the caller's responsibility so it can use
+// the existing task-scoped idempotency claim.
+func (s *OpenAIGatewayService) ObserveGrokVideoCompletion(
+	ctx context.Context,
+	account *Account,
+	requestID string,
+	onDone func(*OpenAIForwardResult),
+) error {
+	options := grokVideoCompletionObserverOptions{
+		InitialDelay:        defaultGrokVideoObserverInitialDelay,
+		PollInterval:        defaultGrokVideoObserverPollInterval,
+		RequestTimeout:      defaultGrokVideoObserverRequestTimeout,
+		MaxDuration:         defaultGrokVideoObserverMaxDuration,
+		MaxAttempts:         defaultGrokVideoObserverMaxAttempts,
+		MaxConsecutive404:   defaultGrokVideoObserverMaxConsecutive404,
+		NotFoundRetryWindow: defaultGrokVideoObserverNotFoundRetryWindow,
+	}
+	return observeGrokVideoCompletion(ctx, options, func(fetchCtx context.Context) (*grokVideoStatusObservation, error) {
+		return s.fetchGrokVideoStatusObservation(fetchCtx, account, requestID)
+	}, onDone)
+}
+
+func observeGrokVideoCompletion(
+	ctx context.Context,
+	options grokVideoCompletionObserverOptions,
+	fetch grokVideoStatusFetchFunc,
+	onDone func(*OpenAIForwardResult),
+) error {
+	if fetch == nil {
+		return fmt.Errorf("grok video completion observer fetcher is required")
+	}
+	if options.MaxAttempts <= 0 {
+		return fmt.Errorf("grok video completion observer max attempts must be positive")
+	}
+	if options.MaxConsecutive404 <= 0 || options.NotFoundRetryWindow <= 0 {
+		return fmt.Errorf("grok video completion observer 404 retry bounds must be positive")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if options.MaxDuration > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, options.MaxDuration)
+		defer cancel()
+	}
+	if !waitForGrokVideoObservation(ctx, options.InitialDelay) {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil
+		}
+		return ctx.Err()
+	}
+
+	startedAt := time.Now()
+	consecutiveNotFound := 0
+	var lastErr error
+	for attempt := 0; attempt < options.MaxAttempts; attempt++ {
+		fetchCtx := ctx
+		cancelFetch := func() {}
+		if options.RequestTimeout > 0 {
+			fetchCtx, cancelFetch = context.WithTimeout(ctx, options.RequestTimeout)
+		}
+		observation, err := fetch(fetchCtx)
+		cancelFetch()
+		if err != nil {
+			lastErr = err
+			consecutiveNotFound = 0
+		} else if observation != nil {
+			lastErr = nil
+			if observation.HTTPStatus == http.StatusNotFound {
+				consecutiveNotFound++
+				withinRetryWindow := options.NotFoundRetryWindow > 0 && time.Since(startedAt) <= options.NotFoundRetryWindow
+				if !withinRetryWindow || consecutiveNotFound >= options.MaxConsecutive404 {
+					return nil
+				}
+			} else {
+				consecutiveNotFound = 0
+				switch {
+				case observation.HTTPStatus >= 300 && observation.HTTPStatus < 500 && observation.HTTPStatus != http.StatusTooManyRequests:
+					return nil
+				case observation.HTTPStatus >= 500 || observation.HTTPStatus == http.StatusTooManyRequests:
+					// Transient provider errors retry within the global attempt/time bounds.
+				default:
+					switch strings.ToLower(strings.TrimSpace(observation.Status)) {
+					case "done":
+						if observation.Result != nil && onDone != nil {
+							onDone(observation.Result)
+						}
+						return nil
+					case "failed", "expired":
+						return nil
+					}
+				}
+			}
+		}
+
+		if attempt+1 >= options.MaxAttempts {
+			break
+		}
+		if !waitForGrokVideoObservation(ctx, options.PollInterval) {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil
+			}
+			return ctx.Err()
+		}
+	}
+	return lastErr
+}
+
+func waitForGrokVideoObservation(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (s *OpenAIGatewayService) fetchGrokVideoStatusObservation(
+	ctx context.Context,
+	account *Account,
+	requestID string,
+) (*grokVideoStatusObservation, error) {
+	requestID = strings.TrimSpace(requestID)
+	if s == nil || s.httpUpstream == nil {
+		return nil, fmt.Errorf("grok video observer upstream client is unavailable")
+	}
+	if account == nil || account.Platform != PlatformGrok {
+		return nil, fmt.Errorf("grok video observer account is invalid")
+	}
+	if requestID == "" {
+		return nil, fmt.Errorf("grok video observer request id is required")
+	}
+	// Bound concurrent background HTTP work without dropping whole task
+	// observers. Each task remains independently capped by duration and attempts.
+	select {
+	case grokVideoObserverRequestSlots <- struct{}{}:
+		defer func() { <-grokVideoObserverRequestSlots }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	accountSlot, err := s.tryAcquireAccountSlot(ctx, account.ID, account.Concurrency)
+	if err != nil {
+		return nil, err
+	}
+	if accountSlot == nil || !accountSlot.Acquired {
+		return nil, fmt.Errorf("grok video observer account concurrency is full")
+	}
+	if accountSlot.ReleaseFunc != nil {
+		defer accountSlot.ReleaseFunc()
+	}
+
+	token, _, err := s.getRequestCredential(ctx, nil, account)
+	if err != nil {
+		return nil, err
+	}
+	targetURL, err := buildGrokMediaURL(account, s.cfg, GrokMediaEndpointVideoStatus, requestID)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	if account.IsGrokOAuth() && isGrokCLIProxyTarget(targetURL) {
+		applyGrokCLIHeaders(req.Header)
+	}
+	account.ApplyHeaderOverrides(req.Header)
+
+	proxyURL := ""
+	if account.ProxyID != nil && account.Proxy != nil {
+		proxyURL = account.Proxy.URL()
+	}
+	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := ReadUpstreamResponseBody(resp.Body, s.cfg, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	observation := &grokVideoStatusObservation{HTTPStatus: resp.StatusCode}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return observation, nil
+	}
+	s.updateGrokUsageFromResponse(withGrokTeamRateLimitModel(ctx, ""), account, resp.Header, resp.StatusCode)
+	observation.Status = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "status").String()))
+	if observation.Status == "done" {
+		observation.Result = ExtractGrokVideoBillingFromStatusBody(body, nil, requestID)
+	}
+	return observation, nil
+}
+
+// GrokMediaBeforeResponse runs after a successful upstream JSON response has
+// been parsed but before any bytes are committed to the downstream client.
+// Async create handlers use it to persist task ownership and billing state so
+// an immediate status poll cannot race the state write.
+type GrokMediaBeforeResponse func(result *OpenAIForwardResult) error
+
 func (s *OpenAIGatewayService) ForwardGrokMedia(
 	ctx context.Context,
 	c *gin.Context,
@@ -605,6 +953,35 @@ func (s *OpenAIGatewayService) ForwardGrokMedia(
 	requestID string,
 	body []byte,
 	contentType string,
+) (*OpenAIForwardResult, error) {
+	return s.forwardGrokMedia(ctx, c, account, endpoint, requestID, body, contentType, nil)
+}
+
+// ForwardGrokMediaWithBeforeResponse is the state-safe variant for async media
+// creation. The callback must finish successfully before the upstream response
+// is exposed to the client.
+func (s *OpenAIGatewayService) ForwardGrokMediaWithBeforeResponse(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	endpoint GrokMediaEndpoint,
+	requestID string,
+	body []byte,
+	contentType string,
+	beforeResponse GrokMediaBeforeResponse,
+) (*OpenAIForwardResult, error) {
+	return s.forwardGrokMedia(ctx, c, account, endpoint, requestID, body, contentType, beforeResponse)
+}
+
+func (s *OpenAIGatewayService) forwardGrokMedia(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	endpoint GrokMediaEndpoint,
+	requestID string,
+	body []byte,
+	contentType string,
+	beforeResponse GrokMediaBeforeResponse,
 ) (*OpenAIForwardResult, error) {
 	startTime := time.Now()
 	if account == nil {
@@ -682,10 +1059,35 @@ func (s *OpenAIGatewayService) ForwardGrokMedia(
 		proxyURL = account.Proxy.URL()
 	}
 	upstreamStart := time.Now()
-	resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
-	SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
-	if err != nil {
-		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+	var resp *http.Response
+	for attempt := 0; ; attempt++ {
+		attemptReq := upstreamReq
+		if attempt > 0 {
+			attemptReq = upstreamReq.Clone(upstreamCtx)
+		}
+		resp, err = s.httpUpstream.Do(attemptReq, proxyURL, account.ID, account.Concurrency)
+		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
+		if err != nil {
+			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+		}
+		startupNotFound := endpoint == GrokMediaEndpointVideoStatus &&
+			resp.StatusCode == http.StatusNotFound &&
+			grokVideoStartupNotFoundFallbackEnabled(ctx)
+		if !startupNotFound {
+			break
+		}
+		// Consume a bounded error body so the transport can reuse the connection;
+		// this expected registration race is not an account-health failure.
+		_ = s.readUpstreamErrorBody(resp)
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if attempt+1 >= grokVideoStartupNotFoundMaxAttempts {
+			return writeGrokVideoPendingStatusResponse(c, requestID, startTime), nil
+		}
+		if err := sleepWithContext(upstreamCtx, grokVideoStartupNotFoundRetryDelay); err != nil {
+			return nil, err
+		}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -717,7 +1119,6 @@ func (s *OpenAIGatewayService) ForwardGrokMedia(
 			grokMediaContentProxyURL(c, requestID),
 		)
 	}
-	writeGrokMediaResponse(c, resp, respBody, s.responseHeaderFilter)
 	usage := grokMediaUsageFromResponse(endpoint, requestInfo, respBody)
 	resultModel := requestModel
 	resultBillingModel := requestModel
@@ -730,7 +1131,7 @@ func (s *OpenAIGatewayService) ForwardGrokMedia(
 			resultBillingModel = m
 		}
 	}
-	return &OpenAIForwardResult{
+	result := &OpenAIForwardResult{
 		RequestID:            requestIDHeader,
 		ResponseID:           usage.ResponseID,
 		Usage:                usage.Usage,
@@ -746,7 +1147,30 @@ func (s *OpenAIGatewayService) ForwardGrokMedia(
 		VideoCount:           usage.VideoCount,
 		VideoResolution:      usage.VideoResolution,
 		VideoDurationSeconds: usage.VideoDurationSeconds,
-	}, nil
+	}
+	if beforeResponse != nil {
+		if err := beforeResponse(result); err != nil {
+			return nil, fmt.Errorf("prepare grok media response state: %w", err)
+		}
+	}
+	writeGrokMediaResponse(c, resp, respBody, s.responseHeaderFilter)
+	result.Duration = time.Since(startTime)
+	return result, nil
+}
+
+func writeGrokVideoPendingStatusResponse(c *gin.Context, requestID string, startTime time.Time) *OpenAIForwardResult {
+	requestID = strings.TrimSpace(requestID)
+	body, _ := json.Marshal(map[string]string{
+		"request_id": requestID,
+		"status":     "pending",
+	})
+	if c != nil {
+		c.Data(http.StatusAccepted, "application/json", body)
+	}
+	return &OpenAIForwardResult{
+		ResponseID: requestID,
+		Duration:   time.Since(startTime),
+	}
 }
 
 func (s *OpenAIGatewayService) forwardGrokMediaVideoContent(
