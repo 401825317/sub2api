@@ -846,8 +846,13 @@ func prepareGrokVideoCompletionBillingWithStatus(
 		return nil, grokVideoBillingPreparationRetryable
 	}
 	if !claimed {
-		reqLog.Debug("grok_media.video_billing_already_claimed", zap.String("request_id", taskRequestID))
-		return nil, grokVideoBillingPreparationAlreadyClaimed
+		// Redis claim ownership is only a hot-path guard. A caller can win the
+		// claim and then fail before the durable usage transaction commits; in
+		// that window another observer must still be allowed to reach
+		// RecordUsage. The PostgreSQL usage_billing_dedup transaction is the
+		// authoritative idempotency boundary, so proceeding here either records
+		// the missing charge or becomes a no-op when the other caller succeeded.
+		reqLog.Debug("grok_media.video_billing_claim_held_using_durable_dedup", zap.String("request_id", taskRequestID))
 	}
 	// Re-merge with pending: resolution is request-only; model/duration fill gaps.
 	merged := *statusResult
