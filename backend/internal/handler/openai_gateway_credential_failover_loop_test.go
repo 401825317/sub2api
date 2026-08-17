@@ -245,6 +245,73 @@ type grokCredentialHandlerTokenCache struct {
 	deleteErr error
 }
 
+// The failover fixture exercises the real Grok media handler as well as the
+// credential loop. Keep a small in-memory GatewayCache so the async video
+// create state can be persisted without coupling this unit test to Redis.
+type grokCredentialHandlerGatewayCache struct {
+	mu      sync.Mutex
+	pending map[string][]byte
+	claimed map[string]bool
+}
+
+var _ service.GatewayCache = (*grokCredentialHandlerGatewayCache)(nil)
+
+func (c *grokCredentialHandlerGatewayCache) GetSessionAccountID(context.Context, int64, string) (int64, error) {
+	return 0, service.ErrStickySessionNotFound
+}
+
+func (c *grokCredentialHandlerGatewayCache) SetSessionAccountID(context.Context, int64, string, int64, time.Duration) error {
+	return nil
+}
+
+func (c *grokCredentialHandlerGatewayCache) RefreshSessionTTL(context.Context, int64, string, time.Duration) error {
+	return nil
+}
+
+func (c *grokCredentialHandlerGatewayCache) DeleteSessionAccountID(context.Context, int64, string) error {
+	return nil
+}
+
+func (c *grokCredentialHandlerGatewayCache) SetGrokVideoPendingBilling(_ context.Context, key string, payload []byte, _ time.Duration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pending == nil {
+		c.pending = make(map[string][]byte)
+	}
+	c.pending[key] = append([]byte(nil), payload...)
+	return nil
+}
+
+func (c *grokCredentialHandlerGatewayCache) GetGrokVideoPendingBilling(_ context.Context, key string) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	payload := c.pending[key]
+	if len(payload) == 0 {
+		return nil, nil
+	}
+	return append([]byte(nil), payload...), nil
+}
+
+func (c *grokCredentialHandlerGatewayCache) ClaimGrokVideoBilled(_ context.Context, key string, _ time.Duration) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.claimed == nil {
+		c.claimed = make(map[string]bool)
+	}
+	if c.claimed[key] {
+		return false, nil
+	}
+	c.claimed[key] = true
+	return true, nil
+}
+
+func (c *grokCredentialHandlerGatewayCache) ReleaseGrokVideoBilled(_ context.Context, key string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.claimed, key)
+	return nil
+}
+
 func (c *grokCredentialHandlerTokenCache) GetAccessToken(context.Context, string) (string, error) {
 	return "", errors.New("not cached")
 }
@@ -924,8 +991,9 @@ func newGrokCredentialFailoverHandler(t *testing.T, mode string) (*OpenAIGateway
 	cfg := &config.Config{RunMode: config.RunModeSimple}
 	cfg.Gateway.MaxAccountSwitches = 3
 	billingCache := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
+	gatewayCache := &grokCredentialHandlerGatewayCache{}
 	gateway := service.NewOpenAIGatewayService(
-		repo, nil, nil, nil, nil, nil, nil, cfg, nil, nil,
+		repo, nil, nil, nil, nil, nil, gatewayCache, cfg, nil, nil,
 		service.NewBillingService(cfg, nil), nil, billingCache, upstream,
 		&service.DeferredService{}, nil, provider, nil, nil, nil, nil, nil,
 	)
